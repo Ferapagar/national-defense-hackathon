@@ -15,6 +15,10 @@ These coordinates will be taken with respect to an arbitrary global coordinate s
  - Center of reference: the first camera will be located at (0,0,0) (with no rotation)
  - Distance measurement: every distance will be calculated relative to the distance between two given reference points.
 
+Finally, this component will have a function that takes as input some camera info and the pixel coordinates of detected objects in each camera and outputs the 3D coordinates of the corresponding rays, which will be of the form:
+- Origin: (r_x, r_y, r_z)
+- Direction: (r_theta, r_phi) in spherical coordinates
+
 
 ## Components
 - `main_calibration.py`: Main script to perform the calibration. It will take as input a set of images from different cameras and output the extrinsic parameters of each camera with respect to an arbitrary global coordinate system.

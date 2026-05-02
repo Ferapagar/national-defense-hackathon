@@ -8,7 +8,7 @@ A robust multi-camera object detection algorithm to detect aerial objects. Each 
 - Low bandwidth usage, reducing costs and improving reliability
 Furthermore, the only data transferred to the central server will be the pixel coordinates of the detected objects, which means that any type of camera can be integrated into the system. This allows the use of different types of sensors, such as infrared or thermal cameras, to detect objects in different environments and conditions.
 
-## The algorithm (Vittorio):
+## The algorithm:
 ### 1. Preprocessing:
 As the cameras will be static, the only pre-processing needed is to calibrate the cameras' position, orientation and focal length into a unified coordinate system. 
 - For that, we will take a single initial picture from each camera, and use feature detection to triangulate relative positions between cameras. 
@@ -35,4 +35,4 @@ For this, we need to add the following pre-processing step that calculates the r
 - We will agreggate the dt_{ij} matrix into a single dt_i vector (relative to an arbitrary camera 0) by minimizing least squares error against the dt_{ij} values for each pair.
 - These dt_{i} values will be used in the object detection pipeline (step 2) to perform the object detection in the correct order and time. As some of the rays may be from different timeframes, the confidence of each object may (and will) be updated over time until all the cameras have been taken into account for that timeframe.
 
-### The systems integration (Fernando):
+### The systems integration:
