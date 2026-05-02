@@ -63,10 +63,11 @@ class Camera:
         self.frame_history.append(feature)
 
 class DetectedObject:
-    def __init__(self, object_id: int, position: np.ndarray, confidence: float):
+    def __init__(self, object_id: int, position: np.ndarray, confidence: float, t_global: Optional[float] = None):
         self.object_id = object_id
         self.position = position
         self.confidence = confidence
+        self.t_global = t_global
 
 class FrozenScene:
     def __init__(self, timestamp: float, voxel_grid_snapshot: np.ndarray, detected_objects_snapshot: List[DetectedObject]):
@@ -124,27 +125,33 @@ class GlobalScene:
             self.voxel_grid_size
         )
         
-    def detect_objects(self, threshold: float = 1.0) -> List[DetectedObject]:
+    def detect_objects(self, threshold: float = 1.0, t_global: Optional[float] = None) -> List[DetectedObject]:
         """
         Thresholds the voxel grid and converts high-intensity voxels into detected objects.
+        Optionally tags each object with the global timestamp it was observed at.
         """
         points = np.argwhere(self.voxel_grid > threshold)
         objects = []
         ext = self.voxel_grid_extent
         sz = self.voxel_grid_size
-        
+
         for i, pt in enumerate(points):
-            # Map grid coordinates back to world position
-            x = ext[0][0] + (pt[0] / sz[0]) * (ext[0][1] - ext[0][0])
-            y = ext[1][0] + (pt[1] / sz[1]) * (ext[1][1] - ext[1][0])
-            z = ext[2][0] + (pt[2] / sz[2]) * (ext[2][1] - ext[2][0])
-            
+            # Map grid coordinates back to world position (centre of voxel).
+            x = ext[0][0] + ((pt[0] + 0.5) / sz[0]) * (ext[0][1] - ext[0][0])
+            y = ext[1][0] + ((pt[1] + 0.5) / sz[1]) * (ext[1][1] - ext[1][0])
+            z = ext[2][0] + ((pt[2] + 0.5) / sz[2]) * (ext[2][1] - ext[2][0])
+
             pos = np.array([x, y, z])
             conf = self.voxel_grid[pt[0], pt[1], pt[2]]
-            objects.append(DetectedObject(i, pos, conf))
-            
+            objects.append(DetectedObject(i, pos, conf, t_global=t_global))
+
         self.detected_objects = objects
         return objects
+
+    def clear_grid(self):
+        """Reset voxel grid for the next per-timestamp aggregation window."""
+        self.voxel_grid = np.zeros(self.voxel_grid_size, dtype=np.float32)
+        self.detected_objects = []
 
     def freeze(self, timestamp: float) -> FrozenScene:
         """
