@@ -1,8 +1,5 @@
-The code can all be run from main.py. 
+This folder contains a small homography and image-stitching reference implementation.
 
-There are multiple functions that borrow code from project3, since the warping procedure is similar. 
+The runnable demo lives in `main.py`. It loads one pair of images from `photos/`, reads the matching point correspondences from `correspondances/`, computes a homography with `compute_H`, warps the first image with `warp_image`, and blends the result into a mosaic.
 
-The homographies section can be recreated by running compute_H on the desired two images.
-
-The warping can be recreated by running warp_image with the desired image and homography matrix. 
-Moscaicing is activated by default for images with image names set in lines 74,75 and correspondences in line 82.
+For full usage notes, file descriptions, input format details, and output explanations, see `../../README.md`.
