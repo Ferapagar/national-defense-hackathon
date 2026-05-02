@@ -26,7 +26,7 @@ The two pipelines differ in *what counts as an "interesting pixel"*:
 ## 2. Repository layout
 
 ```
-Pixeltovoxelprojector/
+raycasting/
 ├── ray_voxel.cpp                       # Standalone C++ ray-caster (Blender pipeline)
 ├── process_image.cpp                   # pybind11 C++ extension (FITS pipeline)
 ├── setup.py                            # Builds process_image_cpp module
@@ -40,7 +40,6 @@ Pixeltovoxelprojector/
 │
 ├── PixelationDecensorer.py             # Independent super-resolution-through-pixelation tool
 │
-├── LICENSE
 └── README.md
 ```
 
