@@ -1,15 +1,19 @@
-"""Two-view relative pose estimation.
+"""Relative pose estimation (2-view and N-view consistency).
 
 Estimate the relative camera pose (rotation R, translation direction t up to scale)
-between two images of the same static scene using SIFT features, the essential
+between images of the same static scene using SIFT features, the essential
 matrix, and OpenCV's recoverPose.
 
-Inputs (default): ../../images/ref-0.jpg, ../../images/test-0.jpg
-Outputs (default): ./out/pose.json, ./out/matches.png, ./out/inliers.png
+Two-view defaults: ../../images/ref-0.jpg, ../../images/test-0.jpg
+Two-view outputs:  ./out/pose.json, ./out/matches.png, ./out/inliers.png
+
+N-view (>= 3 images) runs all pairwise poses and a per-triplet rotation +
+loop-closure consistency check. See multi_view.py / USAGE.md.
 
 Usage:
     python estimate_relative_pose.py
     python estimate_relative_pose.py --ref ../../images/ref-1.jpg --test ../../images/test-1.jpg
+    python estimate_relative_pose.py --images A.jpg B.jpg C.jpg     # N-view consistency
 """
 
 from __future__ import annotations
@@ -151,20 +155,25 @@ def _make_detector():
     return cv2.ORB_create(nfeatures=8000), "ORB", cv2.NORM_HAMMING
 
 
-def detect_and_match(img1_gray: np.ndarray, img2_gray: np.ndarray):
+def detect_features(img_gray: np.ndarray):
+    """Run feature detection on one grayscale image.
+
+    Returns (keypoints, descriptors, detector_name, norm_type). Used by the
+    N-view orchestrator so SIFT runs once per image, not once per pair.
+    """
     detector, name, norm = _make_detector()
-    kp1, des1 = detector.detectAndCompute(img1_gray, None)
-    kp2, des2 = detector.detectAndCompute(img2_gray, None)
-
-    if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10:
+    kp, des = detector.detectAndCompute(img_gray, None)
+    if des is None or len(kp) < 10:
         raise RuntimeError(
-            f"Insufficient features: kp1={len(kp1) if kp1 else 0}, "
-            f"kp2={len(kp2) if kp2 else 0}"
+            f"Insufficient features: kp={len(kp) if kp else 0}"
         )
+    return kp, des, name, norm
 
+
+def match_descriptors(des1, des2, norm: int):
+    """Lowe-ratio match two descriptor sets. Returns the surviving matches."""
     matcher = cv2.BFMatcher(norm, crossCheck=False)
     knn = matcher.knnMatch(des1, des2, k=2)
-
     good = []
     for pair in knn:
         if len(pair) != 2:
@@ -172,6 +181,19 @@ def detect_and_match(img1_gray: np.ndarray, img2_gray: np.ndarray):
         m, n = pair
         if m.distance < RATIO_TEST * n.distance:
             good.append(m)
+    return good
+
+
+def detect_and_match(img1_gray: np.ndarray, img2_gray: np.ndarray):
+    """Two-view convenience wrapper: detect, match, return per-image data.
+
+    Kept for the existing 2-view CLI path and make_inspection.py. New code
+    should prefer detect_features + match_descriptors so per-image features
+    can be cached across many pairs.
+    """
+    kp1, des1, name, norm = detect_features(img1_gray)
+    kp2, des2, _, _ = detect_features(img2_gray)
+    good = match_descriptors(des1, des2, norm)
 
     if len(good) < MIN_INLIERS:
         raise RuntimeError(
@@ -378,6 +400,112 @@ def triangulate_and_validate(
 
 
 # ---------------------------------------------------------------------------
+# Reusable pairwise-pose container (used by both 2-view CLI and N-view path)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PairwisePose:
+    """Everything the N-view orchestrator needs about one pair (i, j).
+
+    Coordinate convention follows OpenCV recoverPose: a point X expressed in
+    camera-i frame becomes ``R @ X + t`` in camera-j frame. ``t_unit`` is the
+    unit-norm translation (essential path) or the small residual translation
+    (homography path); the magnitude is unscaled, scale is fixed in the
+    multi-view step. ``inlier_match_pairs`` stores ``(kp_i_idx, kp_j_idx)``
+    tuples for every inlier match — these indices are what we chain across
+    pairs to recover 3-view tracks.
+    """
+
+    i: int
+    j: int
+    R: np.ndarray
+    t_unit: np.ndarray
+    model: str
+    n_inliers: int
+    n_total_matches: int
+    mean_reproj_error_px: float
+    median_depth: float
+    inlier_match_pairs: np.ndarray  # shape (M, 2) int32: (kp_i_idx, kp_j_idx)
+    pts_i_inliers: np.ndarray  # shape (M, 2) float32 pixel coords in image i
+    pts_j_inliers: np.ndarray  # shape (M, 2) float32 pixel coords in image j
+    plane_normal: Optional[np.ndarray] = None
+
+
+def pairwise_pose(
+    i: int,
+    j: int,
+    img_i_gray: np.ndarray,
+    img_j_gray: np.ndarray,
+    K: np.ndarray,
+    cached_features: Optional[dict] = None,
+) -> PairwisePose:
+    """Estimate the pose of camera j relative to camera i.
+
+    ``cached_features`` (optional) is a dict ``{image_idx: (kp, des, norm)}``
+    so SIFT runs once per image even when called for many pairs. If absent,
+    features are computed on-demand and not cached.
+    """
+    if cached_features is not None and i in cached_features:
+        kp_i, des_i, norm = cached_features[i]
+    else:
+        kp_i, des_i, _, norm = detect_features(img_i_gray)
+        if cached_features is not None:
+            cached_features[i] = (kp_i, des_i, norm)
+
+    if cached_features is not None and j in cached_features:
+        kp_j, des_j, _ = cached_features[j]
+    else:
+        kp_j, des_j, _, _ = detect_features(img_j_gray)
+        if cached_features is not None:
+            cached_features[j] = (kp_j, des_j, norm)
+
+    matches = match_descriptors(des_i, des_j, norm)
+    if len(matches) < MIN_INLIERS:
+        raise RuntimeError(
+            f"pair ({i},{j}): only {len(matches)} matches survived ratio test "
+            f"(need >= {MIN_INLIERS})."
+        )
+
+    pts_i = np.float32([kp_i[m.queryIdx].pt for m in matches])
+    pts_j = np.float32([kp_j[m.trainIdx].pt for m in matches])
+
+    R, t, mask, n_cheir, n_ransac, plane_n, model = recover_pose(pts_i, pts_j, K)
+    n_for_threshold = n_ransac if model == "homography" else n_cheir
+    if n_for_threshold < MIN_INLIERS:
+        raise RuntimeError(
+            f"pair ({i},{j}): only {n_for_threshold} pose inliers (need >= {MIN_INLIERS})."
+        )
+
+    mean_err, median_depth, _ = triangulate_and_validate(pts_i, pts_j, K, R, t, mask)
+
+    t_norm = float(np.linalg.norm(t))
+    t_unit = (t / t_norm).copy() if t_norm > 1e-9 else t.copy()
+
+    inlier_pairs = np.array(
+        [(matches[idx].queryIdx, matches[idx].trainIdx) for idx, keep in enumerate(mask) if keep],
+        dtype=np.int32,
+    )
+    if inlier_pairs.size == 0:
+        inlier_pairs = inlier_pairs.reshape(0, 2)
+
+    return PairwisePose(
+        i=i,
+        j=j,
+        R=R.astype(np.float64),
+        t_unit=t_unit.astype(np.float64),
+        model=model,
+        n_inliers=int(n_for_threshold),
+        n_total_matches=int(len(matches)),
+        mean_reproj_error_px=float(mean_err),
+        median_depth=float(median_depth),
+        inlier_match_pairs=inlier_pairs,
+        pts_i_inliers=pts_i[mask].astype(np.float32),
+        pts_j_inliers=pts_j[mask].astype(np.float32),
+        plane_normal=(np.asarray(plane_n, dtype=np.float64) if plane_n is not None else None),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------
 
@@ -527,8 +655,12 @@ def _parse_K_arg(arg: str) -> np.ndarray:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--ref", type=Path, default=DEFAULT_REF)
-    ap.add_argument("--test", type=Path, default=DEFAULT_TEST)
+    ap.add_argument("--ref", type=Path, default=None,
+                    help="(2-view) reference image path.")
+    ap.add_argument("--test", type=Path, default=None,
+                    help="(2-view) test image path.")
+    ap.add_argument("--images", type=Path, nargs="+", default=None,
+                    help="(N-view) two or more image paths; runs multi_view.estimate_n_view.")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument(
         "--K",
@@ -536,8 +668,27 @@ def main():
         default=None,
         help="Override intrinsics: 'fx,fy,cx,cy' or 9 comma-separated values.",
     )
+    ap.add_argument("--rotation-tolerance-deg", type=float, default=2.0,
+                    help="(N-view) rotation cycle tolerance in degrees.")
+    ap.add_argument("--cycle-tolerance-pct", type=float, default=5.0,
+                    help="(N-view) translation loop residual tolerance, percent.")
     args = ap.parse_args()
-    estimate(args.ref, args.test, args.out, user_K=args.K)
+
+    if args.images is not None:
+        if args.ref is not None or args.test is not None:
+            ap.error("use either --images, OR --ref/--test, not both")
+        from multi_view import estimate_n_view
+        estimate_n_view(
+            args.images, args.out,
+            user_K=args.K,
+            rotation_tolerance_deg=args.rotation_tolerance_deg,
+            cycle_tolerance_pct=args.cycle_tolerance_pct,
+        )
+        return
+
+    ref = args.ref if args.ref is not None else DEFAULT_REF
+    test = args.test if args.test is not None else DEFAULT_TEST
+    estimate(ref, test, args.out, user_K=args.K)
 
 
 if __name__ == "__main__":

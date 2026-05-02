@@ -1,13 +1,17 @@
 # How to use the relative-pose estimator
 
-A practical guide to taking two photos of the same scene and recovering the
-relative position and orientation of the second camera with respect to the
-first.
+A practical guide to taking photos of the same scene and recovering the
+relative position and orientation of each camera with respect to the first.
 
 > **Read this first.** A single pair of monocular images can only tell you
 > the *direction* of camera motion, not metric distance. To get an actual
 > distance in metres you need one extra piece of information — a known
 > baseline, a known object size, or a calibration target. See section 4.
+>
+> **For 3 or more images** the pipeline can additionally cross-check the
+> geometry for self-consistency (rotations and the closed translation
+> triangle), but it still cannot produce metric distances without an
+> external scale anchor. See section 9.
 
 ---
 
@@ -140,10 +144,13 @@ camera2_position_m = scale * t
 `pose.json["median_depth"]` × `scale` then gives the typical scene depth in
 metres.
 
-### Option C — Add a third known-scale view
-A third image with a known displacement from one of the others lets you fix
-scale by sharing triangulated points. That is small-scale SfM and is out of
-scope for this script.
+### Option C — Add a third (or N-th) view to cross-check geometry
+A third image lets the pipeline verify that all three pairwise pose estimates
+are self-consistent — see [section 9](#9-n-view-consistency-check-3-images).
+This does **not** by itself give you metric distance; it only confirms that
+the rotations close their cycle and the translations form a closed triangle
+once their (independently arbitrary) scales are linked. Combine with option A
+or B to additionally turn the result into metres.
 
 ---
 
@@ -222,3 +229,90 @@ depends on which model the estimator selected:
    ```
 
 That's it.
+
+---
+
+## 9. N-view consistency check (3+ images)
+
+When you take 3 or more photos of the same scene, the pipeline runs every
+pairwise pose `(i, j)` and, for every triplet `(i, j, k)`, tells you whether
+the geometry agrees with itself.
+
+### What the check actually proves
+
+A common (incorrect) intuition: *"if I have three images A, B, C, then the
+distance A→B plus B→C should equal A→C, and I can verify that."* This is
+**not** what monocular two-view geometry gives you. Each pairwise estimate
+recovers a translation **direction**; the magnitude is arbitrary and
+specific to that pair. So you can't compare `‖t_AB‖`, `‖t_BC‖`, `‖t_AC‖`
+directly.
+
+What you *can* check, and what the pipeline does:
+
+1. **Rotation cycle.** `R_BC · R_AB` must equal `R_AC`. The angular gap is
+   reported in degrees per triplet. This needs no scale and is the strongest
+   cheap cross-check.
+2. **Translation loop closure.** The pipeline finds 3-D feature tracks
+   visible in all three views, triangulates them in each pair to recover
+   the relative scales `s_AC` and `s_BC` (anchored to `‖t_AB‖ := 1`), then
+   computes the residual
+   `‖(R_BC · t_AB + s_BC · t_BC) − s_AC · t_AC‖` as a percentage of the
+   average translation. Small residual = the triangle of camera positions
+   closes; the geometry is self-consistent.
+
+### Run it
+
+From this directory:
+
+```bash
+python estimate_relative_pose.py --images A.jpg B.jpg C.jpg --out out/cal
+# (multi_view.py exposes the same entry point if you want to call it directly)
+python multi_view.py --images A.jpg B.jpg C.jpg D.jpg --out out/cal
+```
+
+### Read the report
+
+The pipeline writes two files:
+
+- `out/multi_view_report.md` — start here. Per-triplet table with rotation
+  residual (deg), shared-track count, the resolved scales `s_ik` and `s_jk`,
+  the loop residual (%), and a green/yellow/red verdict per triplet.
+- `out/multi_view_report.json` — machine-readable mirror of the above
+  plus every pair's full `R`, `t_unit`, model and inlier counts.
+
+### Verdict legend (defaults)
+
+| Verdict | Condition |
+|---|---|
+| GREEN | rotation cycle < 2°, loop residual < 2.5% |
+| YELLOW | loop residual within 2.5–5%, *or* one or more pairs went through the homography path (translation magnitude unreliable; only rotation is checked) |
+| RED | rotation cycle > 2° *or* loop residual > 5% |
+
+Override tolerances with `--rotation-tolerance-deg` and
+`--cycle-tolerance-pct`.
+
+### When a triplet shows up YELLOW with "homography model"
+
+If any of the three pairs in a triplet was solved via the homography model
+(planar scene or pure rotation), its translation magnitude is unreliable
+and the loop check is skipped. The rotation cycle is still meaningful and
+still runs. To get a GREEN result, re-shoot that pair from a viewpoint with
+a clear translational baseline and non-planar scene content.
+
+### What this does *not* do
+
+- It does **not** recover metric distances. You still need option A, B, or
+  a calibration target from section 4.
+- It does **not** run a full bundle-adjustment SfM pipeline. Residuals will
+  be larger than what e.g. COLMAP produces. For higher-accuracy multi-view
+  reconstruction, feed the same images into a dedicated SfM tool.
+
+### Tests
+
+```bash
+pytest tests/test_multi_view.py
+```
+
+Synthetic 3-camera tests verify that the rotation cycle, scale resolution
+and loop closure return zero on consistent input and flag injected errors —
+no image files needed.
