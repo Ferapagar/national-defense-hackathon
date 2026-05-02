@@ -35,4 +35,12 @@ For this, we need to add the following pre-processing step that calculates the r
 - We will agreggate the dt_{ij} matrix into a single dt_i vector (relative to an arbitrary camera 0) by minimizing least squares error against the dt_{ij} values for each pair.
 - These dt_{i} values will be used in the object detection pipeline (step 2) to perform the object detection in the correct order and time. As some of the rays may be from different timeframes, the confidence of each object may (and will) be updated over time until all the cameras have been taken into account for that timeframe.
 
-### The systems integration:
+
+
+## Next steps:
+Now that the calibration and raycasting have been implemented, we need to: 
+[ ] Combine the two stages of the pipeline (calibration and raycasting) in a separate script that performs the whole pipeline with no external input (i.e. with recorded data) 
+[ ] Record video data with the real cameras to start testing the full pipeline
+[ ] Refactor code to include real-time capabilities ensuring that static video data still works as expected
+[ ]  
+    

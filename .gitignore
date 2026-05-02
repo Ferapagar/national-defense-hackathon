@@ -16,3 +16,6 @@ object-detection/calibration/out/
 
 # OS cruft
 .DS_Store
+
+# Data
+data/*
