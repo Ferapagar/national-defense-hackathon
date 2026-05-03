@@ -126,12 +126,150 @@ def test_motion_extraction_picks_up_moving_pixels(tmp_path: Path):
     assert all(f.motion_total > 0 for f in frames)
 
 
+def _write_low_contrast_video(path: Path, n_frames: int, w: int = 64, h: int = 48,
+                              fps: float = 30.0, motion_radius: int = 4,
+                              bg: int = 120, fg: int = 132) -> None:
+    """Mid-grey background with a slightly brighter square that moves rightward.
+
+    The bg/fg gap (12 levels) is below the legacy threshold of 25 used by the
+    intensity-only detector, so the edge channel is what surfaces the motion.
+    """
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(path), fourcc, fps, (w, h))
+    for i in range(n_frames):
+        frame = np.full((h, w, 3), bg, dtype=np.uint8)
+        cx = (i * 2) % (w - motion_radius * 2 - 1) + motion_radius
+        cy = h // 2
+        frame[cy - motion_radius:cy + motion_radius,
+              cx - motion_radius:cx + motion_radius] = fg
+        writer.write(frame)
+    writer.release()
+
+
+def test_edge_channel_detects_low_contrast_motion(tmp_path: Path):
+    """The edge channel must surface motion that the intensity threshold misses."""
+    video = tmp_path / "low_contrast.mp4"
+    _write_low_contrast_video(video, n_frames=10)
+
+    # Intensity-only with the legacy threshold of 25: the 12-level fg/bg gap
+    # never crosses the threshold, so no motion is reported.
+    intensity_only = list(
+        extract_motion(video, camera_id=0, threshold=25, detect_mode="intensity",
+                       dither=False, morph_open_ksize=0)
+    )
+    assert all(f.motion_total == 0 for f in intensity_only), (
+        "intensity-only at threshold=25 should miss the low-contrast square"
+    )
+
+    # Edge-only: should pick up the moving edges of the square.
+    edge_only = list(
+        extract_motion(video, camera_id=0, detect_mode="edge", dither=False)
+    )
+    assert any(f.motion_total > 0 for f in edge_only), (
+        "edge channel should detect moving edges even when |ΔI| is small"
+    )
+
+
+def test_combined_mode_at_least_as_sensitive(tmp_path: Path):
+    """Combined mode must dominate either single-channel mode in motion_total."""
+    video = tmp_path / "synthetic.mp4"
+    _write_synthetic_video(video, n_frames=10)
+
+    common = dict(camera_id=0, threshold=20, dither=False, morph_open_ksize=0)
+    intensity = list(extract_motion(video, detect_mode="intensity", **common))
+    edge = list(extract_motion(video, detect_mode="edge", **common))
+    combined = list(extract_motion(video, detect_mode="combined", **common))
+
+    n = min(len(intensity), len(edge), len(combined))
+    assert n > 0
+    for i, e, c in zip(intensity[:n], edge[:n], combined[:n]):
+        # OR mask → combined cannot be below either single channel.
+        assert c.motion_total >= i.motion_total - 1e-9
+        assert c.motion_total >= e.motion_total - 1e-9
+
+
+def test_invalid_detect_mode_raises(tmp_path: Path):
+    video = tmp_path / "synthetic.mp4"
+    _write_synthetic_video(video, n_frames=3)
+    with pytest.raises(ValueError, match="detect_mode"):
+        list(extract_motion(video, camera_id=0, detect_mode="bogus"))  # type: ignore[arg-type]
+
+
 def test_collect_calibration_history_returns_n_frames(tmp_path: Path):
     video = tmp_path / "synthetic.mp4"
     _write_synthetic_video(video, n_frames=15)
     frames, history = collect_calibration_history(video, camera_id=0, n_frames=8)
     assert len(frames) == 8
     assert history.shape == (8,)
+
+
+# ---------------- consensus detection ----------------
+
+def test_consensus_suppresses_single_camera_artifacts():
+    """A voxel hit only by cam 0's rays must be rejected when consensus>=2."""
+    from scene import Camera, GlobalScene  # noqa: WPS433 (test-local)
+
+    extent = [(-2, 2), (-2, 2), (0, 4)]
+    sz = (16, 16, 16)
+    scene = GlobalScene(voxel_grid_extent=extent, voxel_grid_size=sz)
+
+    cam0 = Camera(camera_id=0, fov=60.0, resolution=(8, 8),
+                   position=np.array([0.0, 0.0, 0.0]),
+                   rotation=np.eye(3))
+    cam1 = Camera(camera_id=1, fov=60.0, resolution=(8, 8),
+                   position=np.array([1.0, 0.0, 0.0]),
+                   rotation=np.eye(3))
+    scene.add_camera(cam0)
+    scene.add_camera(cam1)
+
+    # cam 0 sees a bright pixel at the centre of its image (= ray straight forward)
+    img0 = np.zeros((8, 8), dtype=np.uint8)
+    img0[4, 4] = 200
+    scene.aggregate_rays(cam0.generate_rays(img0, local_timestamp=0.0))
+
+    # cam 1 sees nothing (blank frame).
+    img1 = np.zeros((8, 8), dtype=np.uint8)
+    scene.aggregate_rays(cam1.generate_rays(img1, local_timestamp=0.0))
+
+    # consensus=2: nothing should pass (cam 1 contributed no rays).
+    objs = scene.detect_objects(threshold=1.0, consensus=2)
+    assert objs == []
+    # consensus=1: cam 0's rays alone should still light up some voxels.
+    objs1 = scene.detect_objects(threshold=1.0, consensus=1)
+    assert len(objs1) > 0
+
+
+def test_consensus_finds_intersection_when_both_cameras_agree():
+    """Two cameras converging at a target produce a detection at the intersection."""
+    from scene import Camera, GlobalScene  # noqa: WPS433
+
+    extent = [(-2, 2), (-2, 2), (0, 4)]
+    sz = (32, 32, 32)
+    scene = GlobalScene(voxel_grid_extent=extent, voxel_grid_size=sz)
+
+    # Two cameras 2 units apart on X axis, looking +Z.
+    cam0 = Camera(0, fov=60.0, resolution=(16, 16),
+                   position=np.array([-1.0, 0.0, 0.0]), rotation=np.eye(3))
+    cam1 = Camera(1, fov=60.0, resolution=(16, 16),
+                   position=np.array([1.0, 0.0, 0.0]), rotation=np.eye(3))
+    scene.add_camera(cam0)
+    scene.add_camera(cam1)
+
+    # Aim rays at each other so they actually intersect.
+    # cam 0 ray tilted toward +X (cam-frame x_cam>0 → world +X since rot=I).
+    img0 = np.zeros((16, 16), dtype=np.uint8)
+    img0[8, 12] = 200  # column 12, right of centre (cx=8) → +x_cam
+    scene.aggregate_rays(cam0.generate_rays(img0, local_timestamp=0.0))
+
+    # cam 1 ray tilted toward -X.
+    img1 = np.zeros((16, 16), dtype=np.uint8)
+    img1[8, 4] = 200   # column 4, left of centre → -x_cam
+    scene.aggregate_rays(cam1.generate_rays(img1, local_timestamp=0.0))
+
+    objs = scene.detect_objects(threshold=1.0, consensus=2)
+    assert len(objs) > 0, "expected at least one consensus voxel where rays intersect"
+    xs = np.array([o.position[0] for o in objs])
+    assert (np.abs(xs) < 0.7).any(), f"no detections near X=0, got X range [{xs.min()}, {xs.max()}]"
 
 
 # ---------------- end-to-end smoke ----------------

@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from raycasting.raycaster import cast_rays_into_grid_sampled
 from raycasting.calibration import compute_pairwise_dt, compute_global_dt
 
@@ -77,19 +77,33 @@ class FrozenScene:
 
 class GlobalScene:
     """
-    The main continuous structure containing the state of the world, handling the wrapping 
+    The main continuous structure containing the state of the world, handling the wrapping
     of calibration, aggregation, and object detection.
+
+    Maintains one voxel grid PER CAMERA so that detect_objects can require
+    multi-camera consensus (a voxel must be hit by at least N cameras to count
+    as a real intersection). This suppresses the "rays pile up at the camera
+    origin" artifact that a single shared grid produces.
     """
     def __init__(self, voxel_grid_extent: List[Tuple[float, float]], voxel_grid_size: Tuple[int, int, int]):
         self.voxel_grid_extent = voxel_grid_extent
         self.voxel_grid_size = voxel_grid_size
-        self.voxel_grid = np.zeros(voxel_grid_size, dtype=np.float32)
+        self.per_camera_grids: Dict[int, np.ndarray] = {}
         self.cameras: List[Camera] = []
         self.rays: List[RayBatch] = []
         self.detected_objects: List[DetectedObject] = []
 
+    @property
+    def voxel_grid(self) -> np.ndarray:
+        """Sum across cameras (intensity-weighted), useful for visualization
+        and backward compatibility with code that reads the grid directly."""
+        if not self.per_camera_grids:
+            return np.zeros(self.voxel_grid_size, dtype=np.float32)
+        return np.sum(np.stack(list(self.per_camera_grids.values())), axis=0)
+
     def add_camera(self, camera: Camera):
         self.cameras.append(camera)
+        self.per_camera_grids[camera.camera_id] = np.zeros(self.voxel_grid_size, dtype=np.float32)
 
     def calibrate(self):
         """
@@ -98,7 +112,7 @@ class GlobalScene:
         n = len(self.cameras)
         if n < 2:
             return
-            
+
         dt_matrix = []
         for i in range(n):
             for j in range(i+1, n):
@@ -106,59 +120,82 @@ class GlobalScene:
                 hist_b = np.array(self.cameras[j].frame_history)
                 dt_ij = compute_pairwise_dt(hist_a, hist_b)
                 dt_matrix.append((i, j, dt_ij))
-                
+
         global_dts = compute_global_dt(dt_matrix, n)
         for i, cam in enumerate(self.cameras):
             cam.dt_i = global_dts[i]
-            
+
     def aggregate_rays(self, ray_batch: RayBatch):
         """
-        Casts a batch of rays into the 3D voxel grid.
+        Casts a batch of rays into the originating camera's voxel grid.
         """
+        if ray_batch.camera_id not in self.per_camera_grids:
+            raise KeyError(
+                f"RayBatch from unknown camera_id={ray_batch.camera_id}; "
+                "call add_camera() first."
+            )
         self.rays.append(ray_batch)
-        self.voxel_grid = cast_rays_into_grid_sampled(
+        grid = self.per_camera_grids[ray_batch.camera_id]
+        self.per_camera_grids[ray_batch.camera_id] = cast_rays_into_grid_sampled(
             ray_batch.origins,
             ray_batch.directions,
             ray_batch.intensities,
-            self.voxel_grid,
+            grid,
             self.voxel_grid_extent,
-            self.voxel_grid_size
+            self.voxel_grid_size,
         )
-        
-    def detect_objects(self, threshold: float = 1.0, t_global: Optional[float] = None) -> List[DetectedObject]:
+
+    def detect_objects(
+        self,
+        threshold: float = 1.0,
+        consensus: int = 2,
+        t_global: Optional[float] = None,
+    ) -> List[DetectedObject]:
         """
-        Thresholds the voxel grid and converts high-intensity voxels into detected objects.
-        Optionally tags each object with the global timestamp it was observed at.
+        Threshold each camera's grid independently; a voxel becomes a
+        DetectedObject only if at least `consensus` cameras have intensity
+        above `threshold` at that voxel. Confidence is the summed intensity
+        across the agreeing cameras.
         """
-        points = np.argwhere(self.voxel_grid > threshold)
-        objects = []
+        if not self.per_camera_grids:
+            self.detected_objects = []
+            return []
+
+        stack = np.stack(list(self.per_camera_grids.values()))  # (N_cam, Dx, Dy, Dz)
+        presence = (stack > threshold).astype(np.uint8)
+        consensus_count = presence.sum(axis=0)
+        intensity_sum = stack.sum(axis=0)
+
+        mask = consensus_count >= consensus
+        points = np.argwhere(mask)
+        objects: List[DetectedObject] = []
         ext = self.voxel_grid_extent
         sz = self.voxel_grid_size
 
         for i, pt in enumerate(points):
-            # Map grid coordinates back to world position (centre of voxel).
             x = ext[0][0] + ((pt[0] + 0.5) / sz[0]) * (ext[0][1] - ext[0][0])
             y = ext[1][0] + ((pt[1] + 0.5) / sz[1]) * (ext[1][1] - ext[1][0])
             z = ext[2][0] + ((pt[2] + 0.5) / sz[2]) * (ext[2][1] - ext[2][0])
-
             pos = np.array([x, y, z])
-            conf = self.voxel_grid[pt[0], pt[1], pt[2]]
+            conf = float(intensity_sum[pt[0], pt[1], pt[2]])
             objects.append(DetectedObject(i, pos, conf, t_global=t_global))
 
         self.detected_objects = objects
         return objects
 
     def clear_grid(self):
-        """Reset voxel grid for the next per-timestamp aggregation window."""
-        self.voxel_grid = np.zeros(self.voxel_grid_size, dtype=np.float32)
+        """Reset every per-camera voxel grid for the next time bin."""
+        for cam_id in self.per_camera_grids:
+            self.per_camera_grids[cam_id] = np.zeros(self.voxel_grid_size, dtype=np.float32)
         self.detected_objects = []
 
     def freeze(self, timestamp: float) -> FrozenScene:
         """
         Creates an immutable snapshot of the scene for a given timeframe.
+        Stores the SUMMED voxel grid (across cameras) for visualization.
         """
         return FrozenScene(
             timestamp=timestamp,
             voxel_grid_snapshot=self.voxel_grid.copy(),
-            detected_objects_snapshot=list(self.detected_objects)
+            detected_objects_snapshot=list(self.detected_objects),
         )

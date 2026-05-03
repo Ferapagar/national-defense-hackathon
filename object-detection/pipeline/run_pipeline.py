@@ -152,6 +152,7 @@ def run_pipeline(
     voxel_grid_size: tuple[int, int, int] = (64, 64, 64),
     time_bin_s: float = 1.0 / 30.0,
     detection_threshold: float = 1.0,
+    consensus: int = 2,
     calibration_n_frames: int = 30,
     max_frames_per_camera: int | None = None,
     motion_kwargs: dict | None = None,
@@ -176,7 +177,9 @@ def run_pipeline(
         if bin_start is None:
             bin_start = t_global
         if (t_global - bin_start) >= time_bin_s:
-            scene.detect_objects(threshold=detection_threshold, t_global=bin_start)
+            scene.detect_objects(
+                threshold=detection_threshold, consensus=consensus, t_global=bin_start
+            )
             frozen.append(scene.freeze(timestamp=bin_start))
             scene.clear_grid()
             bin_start = t_global
@@ -187,7 +190,9 @@ def run_pipeline(
 
     # Flush the last bin.
     if bin_start is not None:
-        scene.detect_objects(threshold=detection_threshold, t_global=bin_start)
+        scene.detect_objects(
+            threshold=detection_threshold, consensus=consensus, t_global=bin_start
+        )
         frozen.append(scene.freeze(timestamp=bin_start))
 
     print(f"Produced {len(frozen)} frozen scenes across {n_bins+1} time bins "
@@ -212,7 +217,12 @@ def main():
     parser.add_argument("--time-bin-ms", type=float, default=33.3,
                         help="Width of each time bin (ms). One FrozenScene per bin.")
     parser.add_argument("--threshold", type=float, default=1.0,
-                        help="Voxel intensity threshold above which a voxel becomes a DetectedObject.")
+                        help="Per-camera voxel intensity threshold; a voxel must exceed this in "
+                             ">=`consensus` cameras to count.")
+    parser.add_argument("--consensus", type=int, default=2,
+                        help="Minimum number of cameras that must independently see a voxel "
+                             "above --threshold before it becomes a DetectedObject. Set to 1 to "
+                             "reproduce the old single-grid behaviour (with its near-camera artifacts).")
     parser.add_argument("--calibration-frames", type=int, default=30,
                         help="Warm-up frames per camera for time-sync.")
     parser.add_argument("--max-frames", type=int, default=None,
@@ -236,6 +246,7 @@ def main():
         voxel_grid_size=grid_size,
         time_bin_s=args.time_bin_ms / 1000.0,
         detection_threshold=args.threshold,
+        consensus=args.consensus,
         calibration_n_frames=args.calibration_frames,
         max_frames_per_camera=args.max_frames,
     )

@@ -22,13 +22,19 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-from .intrinsics import K_to_fov_deg
+# Allow `python pipeline/build_world_frame.py …` from object-detection/.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from pipeline.intrinsics import K_to_fov_deg
+else:
+    from .intrinsics import K_to_fov_deg
 
 
 @dataclass(frozen=True)
