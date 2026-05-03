@@ -17,7 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.intrinsics import K_to_fov_deg, fov_deg_to_focal_px  # noqa: E402
-from pipeline.build_world_frame import build_world_cameras  # noqa: E402
+from pipeline.build_world_frame import (  # noqa: E402
+    WorldCamera,
+    world_cameras_from_reference_system,
+)
 from pipeline.motion_extraction import extract_motion, collect_calibration_history  # noqa: E402
 from pipeline.run_pipeline import run_pipeline  # noqa: E402
 
@@ -34,71 +37,76 @@ def test_K_to_fov_deg_roundtrip():
 
 # ---------------- build_world_frame ----------------
 
-def _synthetic_multi_view_report(tmp: Path) -> Path:
-    """Three cameras: cam 0 at origin, cam 1 at +X (baseline=1 unit before scaling),
-    cam 2 at +X with twice the displacement (scale_0_2 == 2.0)."""
-    K = [[1000, 0, 960], [0, 1000, 540], [0, 0, 1]]
+class _StubReferenceSystem:
+    """Minimal duck-type for `ReferenceSystem`; just exposes `camera_params`.
 
-    # OpenCV convention: X_j = R @ X_i + t. With cam 1 to the +X of cam 0 and
-    # cam 1 looking in the same direction as cam 0, R = I and t points from
-    # cam1's origin BACK toward cam0 (i.e. -X in cam1's frame). So t_unit = (-1, 0, 0).
-    pair_01 = {"i": 0, "j": 1, "R": np.eye(3).tolist(), "t_unit": [-1.0, 0.0, 0.0],
-               "model": "essential", "n_inliers": 200, "n_total_matches": 250,
-               "mean_reproj_error_px": 0.3, "median_depth": 10.0, "plane_normal": None}
-    pair_02 = {"i": 0, "j": 2, "R": np.eye(3).tolist(), "t_unit": [-1.0, 0.0, 0.0],
-               "model": "essential", "n_inliers": 200, "n_total_matches": 250,
-               "mean_reproj_error_px": 0.3, "median_depth": 10.0, "plane_normal": None}
-    pair_12 = {"i": 1, "j": 2, "R": np.eye(3).tolist(), "t_unit": [-1.0, 0.0, 0.0],
-               "model": "essential", "n_inliers": 200, "n_total_matches": 250,
-               "mean_reproj_error_px": 0.3, "median_depth": 10.0, "plane_normal": None}
-    triplet_012 = {"i": 0, "j": 1, "k": 2,
-                   "rotation_residual_deg": 0.0, "n_shared_tracks": 100,
-                   "scale_ik": 2.0, "scale_jk": 1.0,
-                   "loop_residual_norm": 0.0, "loop_residual_pct": 0.0,
-                   "translation_check_skipped": False, "skip_reason": None}
+    Matches the dict layout that `calibration.calibration.ReferenceSystem`
+    populates: `{title: (position_native, rotation_cam_to_world)}`.
+    """
 
-    payload = {
-        "images": ["cam0.jpg", "cam1.jpg", "cam2.jpg"],
-        "K": K, "intrinsic_source": "synthetic",
-        "pairs": [pair_01, pair_02, pair_12],
-        "pair_failures": [],
-        "triplets": [triplet_012],
-    }
-    p = tmp / "multi_view_report.json"
-    p.write_text(json.dumps(payload))
-    return p
+    def __init__(self, camera_params):
+        self.camera_params = camera_params
 
 
-def test_build_world_frame_anchors_cam0_at_origin(tmp_path: Path):
-    report = _synthetic_multi_view_report(tmp_path)
-    cams = build_world_cameras(report, baseline_m=2.0, resolution_wh=(1920, 1080))
+def _three_cam_stub() -> _StubReferenceSystem:
+    """cam 0 at origin, cam 1 one native unit along +X, cam 2 two units along +X."""
+    return _StubReferenceSystem({
+        "cam0": (np.zeros(3), np.eye(3)),
+        "cam1": (np.array([1.0, 0.0, 0.0]), np.eye(3)),
+        "cam2": (np.array([2.0, 0.0, 0.0]), np.eye(3)),
+    })
+
+
+def test_world_cameras_anchor_cam0_at_origin():
+    rs = _three_cam_stub()
+    cams = world_cameras_from_reference_system(
+        rs, ["cam0.jpg", "cam1.jpg", "cam2.jpg"],
+        baseline_m=2.0, resolution_wh=(1920, 1080), fov_deg=60.0,
+    )
     assert len(cams) == 3
     assert np.allclose(cams[0].position, [0, 0, 0])
     assert np.allclose(cams[0].rotation, np.eye(3))
 
 
-def test_build_world_frame_uses_metric_baseline(tmp_path: Path):
-    report = _synthetic_multi_view_report(tmp_path)
-    cams = build_world_cameras(report, baseline_m=2.0, resolution_wh=(1920, 1080))
-    # cam 1 sits at -R^T @ t * baseline. With R=I and t=(-1,0,0), -R^T @ t = (1,0,0),
-    # so position = (baseline, 0, 0) = (2, 0, 0).
+def test_world_cameras_apply_metric_baseline():
+    rs = _three_cam_stub()
+    cams = world_cameras_from_reference_system(
+        rs, ["cam0.jpg", "cam1.jpg", "cam2.jpg"],
+        baseline_m=2.0, resolution_wh=(1920, 1080), fov_deg=60.0,
+    )
+    # ||t_01_native|| = 1, baseline_m = 2.0, so scale = 2.0.
     assert np.allclose(cams[1].position, [2.0, 0.0, 0.0])
 
 
-def test_build_world_frame_chains_through_triplet(tmp_path: Path):
-    report = _synthetic_multi_view_report(tmp_path)
-    cams = build_world_cameras(report, baseline_m=2.0, resolution_wh=(1920, 1080))
-    # cam 2 has scale_ik = 2.0 (||t_02|| = 2 * ||t_01||), so position = (4, 0, 0).
+def test_world_cameras_scale_chained_cameras():
+    rs = _three_cam_stub()
+    cams = world_cameras_from_reference_system(
+        rs, ["cam0.jpg", "cam1.jpg", "cam2.jpg"],
+        baseline_m=2.0, resolution_wh=(1920, 1080), fov_deg=60.0,
+    )
+    # cam 2 is 2 native units → 2 * 2.0 = 4.0 metres along +X.
     assert np.allclose(cams[2].position, [4.0, 0.0, 0.0])
 
 
-def test_build_world_frame_rejects_homography_anchor(tmp_path: Path):
-    report = _synthetic_multi_view_report(tmp_path)
-    payload = json.loads(report.read_text())
-    payload["pairs"][0]["model"] = "homography"
-    report.write_text(json.dumps(payload))
-    with pytest.raises(ValueError, match="homography"):
-        build_world_cameras(report, baseline_m=2.0, resolution_wh=(1920, 1080))
+def test_world_cameras_reject_coincident_anchor_pair():
+    rs = _StubReferenceSystem({
+        "cam0": (np.zeros(3), np.eye(3)),
+        "cam1": (np.zeros(3), np.eye(3)),
+    })
+    with pytest.raises(ValueError, match="coincident"):
+        world_cameras_from_reference_system(
+            rs, ["cam0.jpg", "cam1.jpg"],
+            baseline_m=2.0, resolution_wh=(1920, 1080), fov_deg=60.0,
+        )
+
+
+def test_world_cameras_reject_unregistered_camera():
+    rs = _three_cam_stub()
+    with pytest.raises(KeyError, match="not in the reference system"):
+        world_cameras_from_reference_system(
+            rs, ["cam0.jpg", "cam1.jpg", "cam_missing.jpg"],
+            baseline_m=2.0, resolution_wh=(1920, 1080), fov_deg=60.0,
+        )
 
 
 # ---------------- motion_extraction ----------------
@@ -275,9 +283,16 @@ def test_consensus_finds_intersection_when_both_cameras_agree():
 # ---------------- end-to-end smoke ----------------
 
 def test_run_pipeline_end_to_end(tmp_path: Path):
-    """Build synthetic 2-cam calibration + 2 fake videos; run the pipeline; assert non-empty."""
-    report = _synthetic_multi_view_report(tmp_path)
-    cams = build_world_cameras(report, baseline_m=1.0, resolution_wh=(64, 48))
+    """Hand-built 2-cam cameras.json + 2 fake videos; run the pipeline; assert non-empty."""
+    # Synthetic frames don't yield SIFT matches, so skip calibration entirely
+    # and synthesise a known camera rig directly.
+    cams = [
+        WorldCamera(camera_id=0, image_path="cam0.mp4", fov_deg=60.0,
+                    resolution_wh=(64, 48), position=np.zeros(3), rotation=np.eye(3)),
+        WorldCamera(camera_id=1, image_path="cam1.mp4", fov_deg=60.0,
+                    resolution_wh=(64, 48), position=np.array([1.0, 0.0, 0.0]),
+                    rotation=np.eye(3)),
+    ]
     cams_payload = {
         "world_unit": "metres",
         "anchor": {"baseline_m": 1.0, "cam_a": 0, "cam_b": 1},
@@ -286,7 +301,7 @@ def test_run_pipeline_end_to_end(tmp_path: Path):
             {"camera_id": c.camera_id, "image_path": c.image_path,
              "fov_deg": c.fov_deg, "resolution_wh": list(c.resolution_wh),
              "position": c.position.tolist(), "rotation": c.rotation.tolist()}
-            for c in cams[:2]  # 2-cam smoke
+            for c in cams
         ],
     }
     cameras_json = tmp_path / "cameras.json"

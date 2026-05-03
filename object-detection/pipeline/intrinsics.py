@@ -26,7 +26,11 @@ def fov_deg_to_focal_px(fov_deg: float, image_width_px: int) -> float:
 
 
 def load_K_from_pose_json(pose_json_path: str | Path) -> Tuple[np.ndarray, str]:
-    """Load (K, intrinsic_source) from a pose.json written by estimate_relative_pose.py."""
+    """Load (K, intrinsic_source) from a JSON file with `K` and `intrinsic_source` keys.
+
+    Kept as a utility; the current pipeline expects `fov_deg` directly in
+    cameras.json rather than a `K` matrix.
+    """
     with open(pose_json_path, "r") as f:
         payload = json.load(f)
     K = np.asarray(payload["K"], dtype=float)

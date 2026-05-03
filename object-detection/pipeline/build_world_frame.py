@@ -1,40 +1,38 @@
-"""Convert a `multi_view_report.json` (from calibration/multi_view.py) into a
-world-frame `cameras.json` consumable by `scene.Camera`.
+"""Build a world-frame `cameras.json` from N camera images/videos using
+`calibration/calibration.py`.
 
-Conventions (matching OpenCV / calibration/estimate_relative_pose.py):
-- For pair (i, j), `R, t_unit` satisfy `X_j = R @ X_i + t` for a 3-D point X.
-- Hence camera-j centre in cam-i frame = `-R^T @ t`.
-- The Camera object in scene.py interprets `rotation` as cam-frame → world-frame
-  (since `dirs_world = dirs_cam @ rotation.T`).
+Pipeline:
+1. Load each input as a `calibration.Image` (still or first video frame).
+2. Build a `ReferenceSystem` anchored on cams 0 and 1.
+3. Register every additional camera via `ReferenceSystem.get_coords`
+   (law-of-sines triangulation on pairwise translation directions).
+4. Apply metric scale: `||position_1|| := baseline_m`, then serialise to
+   the same `cameras.json` schema that `pipeline.run_pipeline` consumes.
 
-Anchoring (T0.1 step):
-- Cam 0 sits at world origin with identity rotation.
-- Pair (0, 1) is the metric anchor: `||t_01|| := baseline_m`.
-- For every other camera k, pull `scale_0k` from triplet (0, 1, k); then
-  `position_k = baseline_m * scale_0k * (-R_0k.T @ t_unit_0k)`,
-  `rotation_k = R_0k.T`.
-
-The script refuses to chain through any pair whose `model == "homography"`,
-because the homography fallback yields unreliable translation magnitude.
+Conventions match `scene.Camera`:
+- `position` is the camera centre in world frame (= cam-0 frame), in metres.
+- `rotation` maps camera-frame directions to world-frame directions
+  (i.e. `dirs_world = dirs_cam @ rotation.T`).
+- `fov_deg` is the horizontal full-FOV in degrees; supplied via the CLI
+  because the new calibration does NOT estimate intrinsics.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
 # Allow `python pipeline/build_world_frame.py …` from object-detection/.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from pipeline.intrinsics import K_to_fov_deg
-else:
-    from .intrinsics import K_to_fov_deg
+
+from calibration.calibration import Image, ReferenceSystem  # noqa: E402
+
+_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 
 @dataclass(frozen=True)
@@ -43,125 +41,94 @@ class WorldCamera:
     image_path: str
     fov_deg: float
     resolution_wh: tuple[int, int]
-    position: np.ndarray  # (3,)
+    position: np.ndarray  # (3,) metres in world frame
     rotation: np.ndarray  # (3, 3) cam-frame → world-frame
 
 
-def _index_pairs(report: dict) -> dict[tuple[int, int], dict]:
-    return {(p["i"], p["j"]): p for p in report["pairs"]}
+def _load_image(path: str | Path) -> Image:
+    p = Path(path)
+    if p.suffix.lower() in _VIDEO_SUFFIXES:
+        return Image.from_video(str(p))
+    return Image.from_file(str(p))
 
 
-def _index_triplets(report: dict) -> dict[tuple[int, int, int], dict]:
-    return {(t["i"], t["j"], t["k"]): t for t in report["triplets"]}
-
-
-def _camera_from_pair_with_zero(
-    cam_id: int,
-    pair_0k: dict,
-    metric_scale: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (position_in_world, rotation_cam_to_world) for camera `cam_id`,
-    given the pair record for (0, cam_id) and the metric scale of t_0k."""
-    if pair_0k["model"] == "homography":
-        raise ValueError(
-            f"pair (0, {cam_id}) is homography; translation magnitude unreliable. "
-            "Recapture so the essential model can be used, or anchor through a "
-            "different camera."
-        )
-    R = np.asarray(pair_0k["R"], dtype=float)
-    t_unit = np.asarray(pair_0k["t_unit"], dtype=float)
-    t_unit = t_unit / max(np.linalg.norm(t_unit), 1e-12)
-    position = metric_scale * (-R.T @ t_unit)
-    rotation_cam_to_world = R.T
-    return position, rotation_cam_to_world
-
-
-def _resolve_metric_scale_for_k(
-    cam_id: int,
-    triplets: dict[tuple[int, int, int], dict],
+def world_cameras_from_reference_system(
+    rs: ReferenceSystem,
+    image_paths: list[str | Path],
     baseline_m: float,
-) -> float:
-    """Look up scale_0k from triplet (0, 1, k)."""
-    if cam_id == 1:
-        return baseline_m
-    triplet = triplets.get((0, 1, cam_id))
-    if triplet is None:
-        raise KeyError(
-            f"No triplet (0, 1, {cam_id}) in report; cannot resolve scale for cam {cam_id}. "
-            "Make sure all cameras share enough features with cams 0 and 1."
-        )
-    if triplet.get("translation_check_skipped"):
-        raise ValueError(
-            f"triplet (0, 1, {cam_id}) skipped translation: {triplet.get('skip_reason')}"
-        )
-    scale_0k = triplet["scale_ik"]  # convention: anchored at ||t_01|| = 1
-    if not math.isfinite(scale_0k):
-        raise ValueError(
-            f"triplet (0, 1, {cam_id}) reports non-finite scale_ik; cannot anchor cam {cam_id}."
-        )
-    return baseline_m * scale_0k
-
-
-def build_world_cameras(
-    report_path: str | Path,
-    baseline_m: float,
-    resolution_wh: Optional[tuple[int, int]] = None,
+    resolution_wh: tuple[int, int],
+    fov_deg: float,
 ) -> list[WorldCamera]:
-    """Top-level entry: load report, return one WorldCamera per image."""
-    report = json.loads(Path(report_path).read_text())
-    images: list[str] = report["images"]
-    if len(images) < 2:
-        raise ValueError("Need at least 2 cameras (and 3 to chain beyond pair (0,1)).")
+    """Pure-function variant: convert an already-populated `ReferenceSystem`
+    into `WorldCamera`s.
 
-    K = np.asarray(report["K"], dtype=float)
-    if resolution_wh is None:
-        # Recover from K's principal point (assumes image-centred).
-        resolution_wh = (int(round(2 * K[0, 2])), int(round(2 * K[1, 2])))
-    fov_deg = K_to_fov_deg(K, image_width_px=resolution_wh[0])
+    `image_paths` must include the two anchor images (in the order passed to
+    `ReferenceSystem.__init__`) followed by every other camera that has
+    already been registered via `rs.get_coords`.
+    """
+    if len(image_paths) < 2:
+        raise ValueError("need at least 2 cameras")
 
-    pairs = _index_pairs(report)
-    triplets = _index_triplets(report)
-
-    if (0, 1) not in pairs:
-        raise KeyError("Report has no pair (0, 1); needed as the metric anchor.")
-    if pairs[(0, 1)]["model"] == "homography":
+    cam1_title = Path(image_paths[1]).stem
+    if cam1_title not in rs.camera_params:
+        raise KeyError(
+            f"cam 1 ({image_paths[1]}) is not in the reference system; "
+            "did you build the ReferenceSystem with this image?"
+        )
+    t_01_native = np.asarray(rs.camera_params[cam1_title][0], dtype=float)
+    native_baseline = float(np.linalg.norm(t_01_native))
+    if native_baseline < 1e-12:
         raise ValueError(
-            "Pair (0, 1) is homography; translation magnitude is unreliable. "
-            "Recapture so the essential model is selected, or rerun with --anchor a b "
-            "pointing at a non-homography pair (not yet supported)."
+            f"|t_01| in ReferenceSystem is ~0 ({native_baseline:.3e}); "
+            "cam 0 and cam 1 appear coincident — recapture with more separation."
         )
+    metric_scale = baseline_m / native_baseline
 
-    cameras: list[WorldCamera] = [
-        WorldCamera(
-            camera_id=0,
-            image_path=images[0],
-            fov_deg=fov_deg,
-            resolution_wh=resolution_wh,
-            position=np.zeros(3),
-            rotation=np.eye(3),
-        )
-    ]
-
-    for k in range(1, len(images)):
-        if (0, k) not in pairs:
-            raise KeyError(f"Report has no pair (0, {k}); cam {k} cannot be chained from cam 0.")
-        scale = _resolve_metric_scale_for_k(k, triplets, baseline_m)
-        pos, R_world = _camera_from_pair_with_zero(k, pairs[(0, k)], scale)
+    cameras: list[WorldCamera] = []
+    for cam_id, path in enumerate(image_paths):
+        title = Path(path).stem
+        if title not in rs.camera_params:
+            raise KeyError(
+                f"cam {cam_id} ({path}) is not in the reference system; "
+                "register it via rs.get_coords(Image.from_file(path)) first."
+            )
+        position_native, rotation = rs.camera_params[title]
         cameras.append(
             WorldCamera(
-                camera_id=k,
-                image_path=images[k],
+                camera_id=cam_id,
+                image_path=str(path),
                 fov_deg=fov_deg,
-                resolution_wh=resolution_wh,
-                position=pos,
-                rotation=R_world,
+                resolution_wh=tuple(resolution_wh),
+                position=np.asarray(position_native, dtype=float) * metric_scale,
+                rotation=np.asarray(rotation, dtype=float),
             )
         )
-
     return cameras
 
 
-def cameras_to_json(cameras: list[WorldCamera], baseline_m: float, intrinsic_source: str) -> dict:
+def build_world_cameras(
+    image_paths: list[str | Path],
+    baseline_m: float,
+    resolution_wh: tuple[int, int],
+    fov_deg: float,
+) -> list[WorldCamera]:
+    """End-to-end: load images, run calibration, return world cameras."""
+    if len(image_paths) < 2:
+        raise ValueError("need at least 2 cameras (the first two seed the reference system)")
+
+    images = [_load_image(p) for p in image_paths]
+    rs = ReferenceSystem(images[0], images[1])
+    for img in images[2:]:
+        rs.get_coords(img)
+
+    return world_cameras_from_reference_system(
+        rs, image_paths, baseline_m, resolution_wh, fov_deg
+    )
+
+
+def cameras_to_json(
+    cameras: list[WorldCamera], baseline_m: float, intrinsic_source: str
+) -> dict:
     return {
         "world_unit": "metres",
         "anchor": {"baseline_m": baseline_m, "cam_a": 0, "cam_b": 1},
@@ -182,22 +149,32 @@ def cameras_to_json(cameras: list[WorldCamera], baseline_m: float, intrinsic_sou
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--report", required=True, help="Path to multi_view_report.json")
-    parser.add_argument("--baseline-m", type=float, required=True,
-                        help="Tape-measured distance (metres) between cam 0 and cam 1.")
-    parser.add_argument("--resolution", type=str, default=None,
-                        help="Image resolution as 'W,H'. Defaults to inferring from K's principal point.")
+    parser.add_argument(
+        "--images", nargs="+", required=True,
+        help="Two or more image OR video paths. The first two are the metric anchor pair.",
+    )
+    parser.add_argument(
+        "--baseline-m", type=float, required=True,
+        help="Tape-measured distance (metres) between cam 0 and cam 1.",
+    )
+    parser.add_argument(
+        "--resolution", type=str, required=True,
+        help="Image resolution as 'W,H'.",
+    )
+    parser.add_argument(
+        "--fov-deg", type=float, required=True,
+        help="Horizontal full-FOV in degrees (calibration.py does not estimate K).",
+    )
     parser.add_argument("--out", default="cameras.json", help="Output JSON path.")
+    parser.add_argument(
+        "--intrinsic-source", default="cli:--fov-deg",
+        help="Free-form note recorded into cameras.json.",
+    )
     args = parser.parse_args()
 
-    res = None
-    if args.resolution:
-        w, h = args.resolution.split(",")
-        res = (int(w), int(h))
-
-    cams = build_world_cameras(args.report, args.baseline_m, res)
-    report = json.loads(Path(args.report).read_text())
-    payload = cameras_to_json(cams, args.baseline_m, report.get("intrinsic_source", "unknown"))
+    w, h = (int(x) for x in args.resolution.split(","))
+    cams = build_world_cameras(args.images, args.baseline_m, (w, h), args.fov_deg)
+    payload = cameras_to_json(cams, args.baseline_m, args.intrinsic_source)
     Path(args.out).write_text(json.dumps(payload, indent=2))
 
     print(f"Wrote {len(cams)} cameras → {args.out}")
