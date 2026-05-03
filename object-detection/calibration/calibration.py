@@ -29,6 +29,12 @@ class Image:
         title = os.path.splitext(os.path.basename(file_path))[0]
         return Image(frame, title)
 
+    def __str__(self) -> str:
+        return self.title
+    
+    def __repr__(self) -> str:
+        return self.title
+
 # Global library cache for transformation matrices
 _TRANSFORMATION_LIBRARY = {}
 
@@ -44,7 +50,7 @@ def get_relative_pos(img_i: Image, img_j: Image) -> Tuple[np.ndarray, float, flo
         return _TRANSFORMATION_LIBRARY[pair_key]
     
     # 2. Feature Matching
-    sift = cv2.SIFT_create()
+    sift = cv2.SIFT_create(nfeatures=500)
     kp1, des1 = sift.detectAndCompute(img_i.data, None)
     kp2, des2 = sift.detectAndCompute(img_j.data, None)
     
@@ -59,9 +65,16 @@ def get_relative_pos(img_i: Image, img_j: Image) -> Tuple[np.ndarray, float, flo
     if len(good_matches) < 8:
         raise ValueError("Not enough good matches found between images")
         
+    # Draw and save matches visualization
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
+    os.makedirs(out_dir, exist_ok=True)
+    match_img = cv2.drawMatches(img_i.data, kp1, img_j.data, kp2, good_matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    cv2.imwrite(os.path.join(out_dir, f"{img_i.title}_{img_j.title}_segments.jpg"), match_img)
+
     pts1 = np.float32([kp1[m.queryIdx].pt for m in good_matches])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in good_matches])
-    
+    print(pts1.shape)
+    print(pts2.shape)
     N = len(pts1)
     
     def euler_to_matrix(yaw, pitch, roll):
@@ -87,7 +100,6 @@ def get_relative_pos(img_i: Image, img_j: Image) -> Tuple[np.ndarray, float, flo
         r_yaw, r_pitch, r_roll = params[2], params[3], params[4]
         f_i = params[5]
         f_j = params[6]
-        z_prime = params[7:7+N]
         
         # Unit vector t_ij from spherical coordinates
         t_ij = np.array([
@@ -98,31 +110,53 @@ def get_relative_pos(img_i: Image, img_j: Image) -> Tuple[np.ndarray, float, flo
         
         R_ij = euler_to_matrix(r_yaw, r_pitch, r_roll)
         
-        # Vectorized 3D points in camera j
-        q_3d_base = np.hstack((pts2, np.full((N, 1), f_j)))
-        q_3d = q_3d_base * z_prime[:, None]
+        # Vectorized 3D lines direction vectors
+        u = np.hstack((pts1, np.full((N, 1), f_i)))
+        q_j = np.hstack((pts2, np.full((N, 1), f_j)))
+        v = q_j @ R_ij.T  # Direction in camera i's frame
         
-        # Apply transformation (N, 3) @ (3, 3).T + (3,)
-        transformed_q = q_3d @ R_ij.T + t_ij
+        # Dot products for closest points on skew lines
+        a = np.sum(u * u, axis=1)
+        b = np.sum(u * v, axis=1)
+        c = np.sum(v * v, axis=1)
+        e = np.sum(u * t_ij, axis=1)
+        f = np.sum(v * t_ij, axis=1)
         
-        # Proj_{xy}(x,y,z) = (x/z, y/z)
-        proj_q = transformed_q[:, :2] / transformed_q[:, 2:]
+        D = a * c - b**2
+        eps = 1e-8
+        D = np.where(D < eps, eps, D)
         
-        # Target projection mapped to f_i
-        target_p = proj_q * f_i
+        # Line parameter for closest points
+        s_c = (e * c - f * b) / D
+        s_prime_c = (e * b - f * a) / D
         
-        # Calculate residuals and flatten to 1D array
-        residuals = pts1 - target_p
-        return residuals.ravel()
+        # d_l: Shortest distance between the lines
+        n = np.cross(u, v)
+        n_norm = np.linalg.norm(n, axis=1) + eps
+        d = np.abs(np.sum(t_ij * n, axis=1)) / n_norm
+        
+        # d'_l and d''_l: Distances to the closest points
+        d_prime = np.abs(s_c) * np.sqrt(a) + eps
+        d_double_prime = np.abs(s_prime_c) * np.sqrt(c) + eps
+        
+        # Loss function residuals
+        res1 = d / d_prime
+        res2 = d / d_double_prime
+        
+        return np.concatenate((res1, res2))
 
-    # Initial guess
-    initial_params = np.zeros(7 + N)
+    # Initial guess (7 parameters)
+    initial_params = np.zeros(7)
     initial_params[1] = np.pi / 2  # t_theta = 90 deg, so cos(theta) = 0
     initial_params[5] = 1.0        # f_i = 1.0
     initial_params[6] = 1.0        # f_j = 1.0
-    initial_params[7:] = 100.0     # initial depths
     
-    res = least_squares(loss_func, initial_params)
+    bounds = (
+        [-np.inf, -np.inf, -np.inf, -np.inf, -np.inf, 1e-4, 1e-4],
+        [np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf]
+    )
+    
+    res = least_squares(loss_func, initial_params, bounds=bounds)
     opt_params = res.x
     
     t_phi, t_theta = opt_params[0], opt_params[1]
@@ -140,12 +174,14 @@ def get_relative_pos(img_i: Image, img_j: Image) -> Tuple[np.ndarray, float, flo
     M_ij = np.eye(4)
     M_ij[:3, :3] = R_ij
     M_ij[:3, 3] = t_ij
+    print(f_i, f_j)
+    print(M_ij)
     
     _TRANSFORMATION_LIBRARY[pair_key] = (M_ij, f_i, f_j)
     
     # Store M_ji with normalized translation to maintain consistency
     M_ji = np.eye(4)
-    M_ji[:3, :3] = R_ij.T  # No division by s_ij, as proven mathematically
+    M_ji[:3, :3] = R_ij.T
     M_ji[:3, 3] = -R_ij.T @ t_ij
     
     pair_key_ji = (img_j.title, img_i.title)
