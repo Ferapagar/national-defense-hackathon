@@ -32,10 +32,11 @@ class Image:
 # Global library cache for transformation matrices
 _TRANSFORMATION_LIBRARY = {}
 
-def get_relative_pos(img_i: Image, img_j: Image) -> np.ndarray:
+def get_relative_pos(img_i: Image, img_j: Image) -> Tuple[np.ndarray, float, float]:
     """
     Computes a 3D transformation matrix M_{ij} that transforms coordinates 
-    between camera i and camera j using SIFT and least squares optimization.
+    between camera i and camera j using SIFT and least squares optimization,
+    along with focal lengths f_i and f_j.
     """
     # 1. Library Check
     pair_key = (img_i.title, img_j.title)
@@ -84,9 +85,9 @@ def get_relative_pos(img_i: Image, img_j: Image) -> np.ndarray:
     def loss_func(params):
         t_phi, t_theta = params[0], params[1]
         r_yaw, r_pitch, r_roll = params[2], params[3], params[4]
-        s_ij = params[5]
-        z = params[6:6+N]
-        z_prime = params[6+N:]
+        f_i = params[5]
+        f_j = params[6]
+        z_prime = params[7:7+N]
         
         # Unit vector t_ij from spherical coordinates
         t_ij = np.array([
@@ -97,39 +98,37 @@ def get_relative_pos(img_i: Image, img_j: Image) -> np.ndarray:
         
         R_ij = euler_to_matrix(r_yaw, r_pitch, r_roll)
         
-        M_ij = np.zeros((3, 4))
-        M_ij[:, :3] = R_ij * s_ij
-        M_ij[:, 3] = t_ij
+        # Vectorized 3D points in camera j
+        q_3d_base = np.hstack((pts2, np.full((N, 1), f_j)))
+        q_3d = q_3d_base * z_prime[:, None]
         
-        residuals = []
-        for i in range(N):
-            p_i = np.array([pts1[i, 0], pts1[i, 1], 1.0])
-            q_i = np.array([pts2[i, 0], pts2[i, 1], 1.0, 1.0])
-            
-            p_3d = p_i * z[i]
-            q_3d_prime = q_i.copy()
-            q_3d_prime[:3] = q_3d_prime[:3] * z_prime[i]
-            
-            proj_p = p_3d[:2]
-            transformed_q = M_ij @ q_3d_prime
-            proj_q = transformed_q[:2]
-            
-            residuals.extend(proj_p - proj_q)
-            
-        return np.array(residuals)
+        # Apply transformation (N, 3) @ (3, 3).T + (3,)
+        transformed_q = q_3d @ R_ij.T + t_ij
+        
+        # Proj_{xy}(x,y,z) = (x/z, y/z)
+        proj_q = transformed_q[:, :2] / transformed_q[:, 2:]
+        
+        # Target projection mapped to f_i
+        target_p = proj_q * f_i
+        
+        # Calculate residuals and flatten to 1D array
+        residuals = pts1 - target_p
+        return residuals.ravel()
 
     # Initial guess
-    initial_params = np.zeros(6 + 2 * N)
+    initial_params = np.zeros(7 + N)
     initial_params[1] = np.pi / 2  # t_theta = 90 deg, so cos(theta) = 0
-    initial_params[5] = 1.0        # scale = 1.0
-    initial_params[6:] = 100.0     # initial depths
+    initial_params[5] = 1.0        # f_i = 1.0
+    initial_params[6] = 1.0        # f_j = 1.0
+    initial_params[7:] = 100.0     # initial depths
     
     res = least_squares(loss_func, initial_params)
     opt_params = res.x
     
     t_phi, t_theta = opt_params[0], opt_params[1]
     r_yaw, r_pitch, r_roll = opt_params[2], opt_params[3], opt_params[4]
-    s_ij = opt_params[5]
+    f_i = opt_params[5]
+    f_j = opt_params[6]
     
     t_ij = np.array([
         np.sin(t_theta) * np.cos(t_phi),
@@ -139,37 +138,45 @@ def get_relative_pos(img_i: Image, img_j: Image) -> np.ndarray:
     R_ij = euler_to_matrix(r_yaw, r_pitch, r_roll)
     
     M_ij = np.eye(4)
-    M_ij[:3, :3] = R_ij * s_ij
+    M_ij[:3, :3] = R_ij
     M_ij[:3, 3] = t_ij
     
-    _TRANSFORMATION_LIBRARY[pair_key] = M_ij
-    return M_ij
+    _TRANSFORMATION_LIBRARY[pair_key] = (M_ij, f_i, f_j)
+    
+    # Store M_ji with normalized translation to maintain consistency
+    M_ji = np.eye(4)
+    M_ji[:3, :3] = R_ij.T  # No division by s_ij, as proven mathematically
+    M_ji[:3, 3] = -R_ij.T @ t_ij
+    
+    pair_key_ji = (img_j.title, img_i.title)
+    _TRANSFORMATION_LIBRARY[pair_key_ji] = (M_ji, f_j, f_i)
+    
+    return M_ij, f_i, f_j
 
 
 class ReferenceSystem:
     def __init__(self, img_i: Image, img_j: Image):
         self.ref_img_i = img_i
         self.ref_img_j = img_j
-        self.M_ij = get_relative_pos(img_i, img_j)
-        self.camera_params: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self.M_ij, f_i, f_j = get_relative_pos(img_i, img_j)
+        self.camera_params: Dict[str, Tuple[np.ndarray, np.ndarray, float]] = {}
         
         # Add trivial parameters for img_i
-        self.camera_params[img_i.title] = (np.zeros(3), np.eye(3))
+        self.camera_params[img_i.title] = (np.zeros(3), np.eye(3), f_i)
         
         # Add parameters for img_j
         t_ij = self.M_ij[:3, 3]
-        scale_j = np.linalg.norm(self.M_ij[:3, 0])
-        R_ij = self.M_ij[:3, :3] / scale_j
-        self.camera_params[img_j.title] = (t_ij, R_ij)
+        R_ij = self.M_ij[:3, :3]
+        self.camera_params[img_j.title] = (t_ij, R_ij, f_j)
 
-    def get_coords(self, img_k: Image) -> Tuple[np.ndarray, np.ndarray]:
+    def get_coords(self, img_k: Image) -> Tuple[np.ndarray, np.ndarray, float]:
         # 1. Cache Check
         if img_k.title in self.camera_params:
             return self.camera_params[img_k.title]
             
         # 2. Compute transformations
-        M_ik = get_relative_pos(self.ref_img_i, img_k)
-        M_jk = get_relative_pos(self.ref_img_j, img_k)
+        M_ik, _, f_k = get_relative_pos(self.ref_img_i, img_k)
+        M_jk, _, _ = get_relative_pos(self.ref_img_j, img_k)
         
         # 3. Extract translation vectors
         t_ij = self.M_ij[:3, 3]
@@ -177,8 +184,7 @@ class ReferenceSystem:
         t_jk = M_jk[:3, 3]
         
         # 4. Calculate rotation matrix
-        scale_k = np.linalg.norm(M_ik[:3, 0])
-        R_ik = M_ik[:3, :3] / scale_k
+        R_ik = M_ik[:3, :3]
         U_k_ij = R_ik
         
         # Helper to compute angle between two vectors
@@ -205,8 +211,8 @@ class ReferenceSystem:
         v_k_ij = t_ik * d_k_ij
         
         # 8. Store and return
-        self.camera_params[img_k.title] = (v_k_ij, U_k_ij)
-        return v_k_ij, U_k_ij
+        self.camera_params[img_k.title] = (v_k_ij, U_k_ij, f_k)
+        return v_k_ij, U_k_ij, f_k
 
     def to_rays(self, px_coords: np.ndarray, cam_id: str) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -217,12 +223,12 @@ class ReferenceSystem:
         # 1. Retrieve camera params
         if cam_id not in self.camera_params:
             raise KeyError(f"Camera ID '{cam_id}' not found in the reference system.")
-        v, U = self.camera_params[cam_id]
+        v, U, f_k = self.camera_params[cam_id]
         
         n = px_coords.shape[0]
         
         # 2. Directions matrix in local frame
-        D_cam = np.hstack((px_coords, np.ones((n, 1))))
+        D_cam = np.hstack((px_coords, np.full((n, 1), f_k)))
         
         # 3. Transform directions to global frame
         D_global = D_cam @ U.T
