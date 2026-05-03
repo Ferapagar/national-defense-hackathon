@@ -1,0 +1,13 @@
+name: def-hackathon
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.14
+  - nomkl
+  - numpy
+  - scipy
+  - pillow
+  - pip
+  - pip:
+    - opencv-python

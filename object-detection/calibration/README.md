@@ -4,134 +4,27 @@
 The goal of this component is to calibrate the cameras' position, orientation and focal length into a unified coordinate system. 
 For that, we will take a single initial picture from each camera, and use feature detection to triangulate relative positions between cameras. 
 Once the relative positions of the cameras are known, we can use two cameras and a single landmark to establish a global coordinate system and calculate the extrinsic parameters of all cameras.
-Extrisic parameters of a camera:
-- Position: (c_x, c_y, c_z)
-- Orientation: (c_theta, c_phi, c_psi)
-- Focal length: (f_x, f_y)
-These coordinates will be taken with respect to an arbitrary global coordinate system which will be defined around an arbitrary camera:
- - x-axis: the horizontal ray of the optical axis from the first camera
- - y-axis: the direction such that (x, y, z) form a right handed coordinate system
- - z-axis: the vertical ray of the optical axis from the first camera
- - Center of reference: the first camera will be located at (0,0,0) (with no rotation)
- - Distance measurement: every distance will be calculated relative to the distance between two given reference points.
-
-Finally, this component will have a function that takes as input some camera info and the pixel coordinates of detected objects in each camera and outputs the 3D coordinates of the corresponding rays, which will be of the form:
-- Origin: (r_x, r_y, r_z)
-- Direction: (r_theta, r_phi) in spherical coordinates
 
 
-## Components
-- `main_calibration.py`: Main script to perform the calibration. It will take as input a set of images from different cameras and output the extrinsic parameters of each camera with respect to an arbitrary global coordinate system.
-- `estimate_relative_pose.py`: Two-view relative pose estimator. Recovers rotation `R` and unit-norm translation direction `t` between two images of the same static scene using SIFT features, the essential matrix, and OpenCV `recoverPose`. Also dispatches to the N-view path when `--images` is given.
-- `multi_view.py`: N-view consistency checker. Runs all pairwise poses and, for each triplet `(i, j, k)`, validates the rotation cycle `R_jk · R_ij ≈ R_ik` and the translation loop closure after linking pair scales via shared 3-D points. Writes `multi_view_report.{json,md}`.
-- `make_inspection.py`: Per-pair visual sanity check (inlier matches + epipolar lines for the essential model, or warp-overlay for the homography model).
-- `tests/test_multi_view.py`: Synthetic 3-camera tests for the consistency math (rotation cycle, scale resolution, loop closure, failure flagging).
+## Algorithm
+The core of the algorithm will consist on a function relative_pos(img_i, img_j)that takes the initial image from two cameras i and j, and computes a 3d transformation matrix M_{ij} that transforms coordinates from camera i's coordinate system to camera j's coordinate system. The matrix is going to be of the form
+$$ M_{ij} = \begin{bmatrix} R_{ij}s_{ij} & t_{ij} \\ 0 & 1 \end{bmatrix}, $$
+where $t_{ij}$ is a unit vector representing the relative position of camera j with respect to camera i, $s_{ij}$ is the scale factor between the two cameras, and R_{ij} is a composition of yaw, pitch and roll rotations that transforms coordinates from camera i's coordinate system to camera j's coordinate system.
+The algorithm to produce this matrix will be the following:
+- Extract matching points from the two images using feature matching (SIFT)
+- Perform least squares estimation (scipy.optimize.lsq_linear) on the matching points to find the best matching transformation matrix. Given a set of point pairs $(p_i, q_i)_{i=1}^n$, regress for $t_{ij}$, $\phi_{ij}$, $\theta_{ij}$ and $\psi_{ij}$, $s_{ij}$ and $z_i, z_i'$ to minimize the following loss function:
+$$ L = \sum_{i=1}^n ||Proj_{xy}((p_i, 1)z_i) - Proj_{xy}(M_{ij} (q_i, 1)z_i')||^2  \text{ s.t.} ||t_{ij}|| = 1.$$
 
-## Relative pose estimation
 
-> **Looking for a step-by-step walkthrough?** See [USAGE.md](USAGE.md) for a
-> guide to taking two photos, running the estimator, and converting the result
-> into a real-world distance in metres.
+## Data structures
+We will have an Image class that contains image data as a numpy tensor and a title (the camera's id). There will be a static method from_file() that creates an instance from a file path with the title being the filename without the extension, and a from_video() that creates an instance from the first frame of a video.
 
-### Inputs
-- Reference image: `../../images/ref-0.jpg`
-- Test image: `../../images/test-0.jpg`
-- Camera intrinsics `K`: resolved in priority order — explicit `--K` flag → EXIF `FocalLengthIn35mmFilm` → Pixel 8 default (`6.90 mm`, `24 mm` 35mm-equivalent). For a 2268×4032 Pixel 8 photo this gives `fx = fy ≈ 2688 px`, `cx = 1134`, `cy = 2016`.
 
-### Dependencies
-- `opencv-python`
-- `numpy`
-- `Pillow` (optional, for EXIF intrinsics fallback)
+We will have a ReferenceSystem class. An instance will be generated from a pair of initial images (camera i and j) and precomputes the transformation matrix $M_{ij}$. This class will have a function get_coords which takes an image from any camera k and returns a vector $v_{k,ij}$ and a rotation matrix $U_{k,ij}$ (which transforms a pixel coordinates from camera $k$ in the form $(x,y,1)^T$ to the corresponding 3d ray vector in camera i's coordinate system, which is unique up to a constant). get_coords will perform this the following way:
+- Calculate rel_pos(img_i, img_k) and rel_pos(img_j, img_k) to get $M_{ik}$ and $M_{jk}$. $U_{k,ij} = R_{ik}$. 
+- Calculate the angles:
+$$\alpha_{i} = \operatorname{Angle}(t_{ij}, t_{ik}),\quad \alpha_{j} = \operatorname{Angle}(-t_{ij}, t_{jk}),\quad \alpha_{k} = \operatorname{Angle}(t_{ik}, t_{jk})$$
+where $\operatorname{Angle}(u,v) = \arccos(u \cdot v / (||u|| ||v||))$.
+- This way, by law of sines we have $v_{k,ij} = t_{ik}d_{k,ij}$ where $d_{k,ij} =\frac{\sin(\alpha_i)}{\sin(\alpha_k)}$.
 
-### Run
-From this directory:
-
-```bash
-python estimate_relative_pose.py
-# alternate pair / custom K:
-python estimate_relative_pose.py --ref ../../images/ref-1.jpg --test ../../images/test-1.jpg
-python estimate_relative_pose.py --K 2688,2688,1134,2016
-```
-
-### Outputs
-Written to `out/` by default:
-- `pose.json` — `R`, `t`, Euler angles (yaw/pitch/roll, deg), inlier counts, mean reprojection error (px), median triangulated depth, intrinsics matrix, the `K`-resolution path, the selected geometric `model` (`"essential"` or `"homography"`), and `plane_normal` when the homography path is used.
-- `matches.png` — all SIFT matches surviving Lowe's ratio test.
-- `inliers.png` — only the matches accepted by the winning model.
-
-### Model selection (essential vs. homography)
-The script estimates **both** the essential matrix and a homography from the same SIFT correspondences, then picks the appropriate model:
-
-- **Essential matrix** is used for general 3D scenes with real camera translation. Returns a unit-norm `t` (direction only — scale is fundamentally ambiguous).
-- **Homography** is used when the scene is near-planar or the motion is pure rotation. The script switches to this path automatically when (a) the homography has substantially more RANSAC inliers, or (b) the essential matrix's cheirality (positive-depth) check collapses — the classic signature of pure rotation. The homography is decomposed via `cv2.decomposeHomographyMat` and filtered by `filterHomographyDecompByVisibleRefpoints`, with the surviving candidate scored by triangulated-point cheirality and reprojection error.
-
-This is the homography fallback motivated by the reference at [`references/homographies/`](../../references/homographies/), adapted to use OpenCV's RANSAC homography solver instead of hand-labelled correspondences.
-
-### Caveats
-- **Scale ambiguity:** monocular two-view geometry recovers `t` only up to scale.
-- **Pure rotation:** when the homography path is selected with `‖t‖ ≈ 0`, only the rotation is reliable — the translation direction has high uncertainty and the script logs a warning.
-- **Intrinsics:** `K` is approximated from the EXIF 35mm-equivalent focal length using horizontal-FOV equivalence. For best accuracy, calibrate the camera (e.g. checkerboard) and pass the result via `--K`.
-
-## N-view consistency check (3+ images)
-
-When you pass `--images A.jpg B.jpg C.jpg [...]`, the pipeline runs every pairwise pose `(i, j)` and, for every triplet `(i, j, k)`, performs two cross-checks that exploit the redundancy of having the same scene seen from three or more viewpoints.
-
-```bash
-python estimate_relative_pose.py --images A.jpg B.jpg C.jpg --out out/cal
-# or, equivalently:
-python multi_view.py            --images A.jpg B.jpg C.jpg --out out/cal
-```
-
-### What gets checked
-
-1. **Rotation cycle.** `R_jk · R_ij` should equal `R_ik`. Any difference (in degrees) is reported per triplet. This needs no scale resolution and is the strongest cheap sanity check.
-2. **Translation loop closure.** Two-view geometry recovers `t` only up to scale, so the magnitudes of `t_ij`, `t_jk`, `t_ik` are not directly comparable — each pair has its own arbitrary scale. The pipeline first resolves the relative scales `s_ik` and `s_jk` (anchored to `‖t_ij‖ := 1`) by triangulating shared 3-D feature tracks visible in all three views, then computes the residual `‖(R_jk · t_ij + s_jk · t_jk) − s_ik · t_ik‖` as a percentage of the average translation. Small values mean the triangle of camera positions closes; large values mean one of the pairs is geometrically inconsistent.
-
-> **Common misconception, important to flag:** with three images you cannot directly verify "x + y = z" in metres. Each pairwise translation has its own unknown scalar. The right consistency check is *cycle closure*: after linking the scales, the chain through `j` must reproduce the direct `(i, k)` triangle within tolerance. The report explains this in plain language too.
-
-### Outputs
-
-`out/multi_view_report.json` — pairwise poses + per-triplet consistency:
-
-```json
-{
-  "images": ["A.jpg", "B.jpg", "C.jpg"],
-  "K": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
-  "intrinsic_source": "exif:f35=24.0",
-  "pairs": [{"i": 0, "j": 1, "R": [[...]], "t_unit": [...], "model": "essential", "n_inliers": 247, ...}],
-  "pair_failures": [],
-  "triplets": [{
-    "i": 0, "j": 1, "k": 2,
-    "rotation_residual_deg": 0.31,
-    "n_shared_tracks": 142,
-    "scale_ik": 1.04, "scale_jk": 1.41,
-    "loop_residual_norm": 0.07, "loop_residual_pct": 2.1,
-    "translation_check_skipped": false,
-    "skip_reason": null
-  }]
-}
-```
-
-`out/multi_view_report.md` — human-readable summary with a green/yellow/red verdict per triplet.
-
-### Tolerances and verdict
-
-Defaults (overridable via `--rotation-tolerance-deg` and `--cycle-tolerance-pct`):
-
-| Verdict | Condition |
-|---|---|
-| **GREEN** | rotation cycle < 2°, loop residual < 2.5% |
-| **YELLOW** | loop residual within 2.5–5%, *or* one or more pairs went through the homography path (translation magnitude unreliable, only rotation is checked) |
-| **RED** | rotation cycle > 2°, *or* loop residual > 5% |
-
-### When the translation check is skipped
-
-If any pair in a triplet was solved with the homography model (planar / pure-rotation scene), its translation magnitude is unreliable and the loop check is skipped for that triplet. The rotation cycle check still runs.
-
-### Tests
-
-```bash
-pytest tests/test_multi_view.py
-```
-
-The synthetic-scene tests don't need any image files — they fabricate 3 known camera positions, project a random 3-D point cloud, and verify that the rotation cycle, scale resolution, and loop closure all return zero on consistent input and flag injected errors.
+The ReferenceSystem class will also save each camera's parameters ($v_{k,ij}$ and $U_{k,ij}$) relative to the reference coordinate system from cameras i and j as a dict whose keys are the images' titles (i.e. the cameras' ids). During init, it will also add the parameters for the reference images (i and j) which are trivial to calculate after computing the transformation matrix $M_{ij}$.
