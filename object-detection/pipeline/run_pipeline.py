@@ -227,6 +227,19 @@ def main():
                         help="Warm-up frames per camera for time-sync.")
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Cap on frames decoded per camera (debug).")
+    parser.add_argument("--detect-mode", choices=["intensity", "edge", "combined"],
+                        default="combined",
+                        help="Motion-detection channel(s): intensity (ray_voxel.cpp absdiff), "
+                             "edge (PixelationDecensorer Sobel-magnitude), or both OR'd.")
+    parser.add_argument("--motion-threshold", type=int, default=3,
+                        help="Per-pixel absdiff threshold for the intensity channel (0..255).")
+    parser.add_argument("--edge-threshold", type=float, default=0.5,
+                        help="Threshold on z-normalised edge-magnitude diff.")
+    parser.add_argument("--motion-stride", type=int, default=1,
+                        help="Compare frame i against frame i-stride (larger = more displacement).")
+    parser.add_argument("--pixel-stride", type=int, default=1,
+                        help="Decimate motion mask spatially by every Nth pixel. "
+                             "N=4 → 16× fewer rays through the voxel grid.")
     parser.add_argument("--out", type=Path, default=Path("frozen_scenes.pkl"))
     args = parser.parse_args()
 
@@ -239,6 +252,14 @@ def main():
     if len(grid_size) != 3:
         parser.error("--grid-size must be three ints: Dx,Dy,Dz")
 
+    motion_kwargs = {
+        "detect_mode": args.detect_mode,
+        "threshold": args.motion_threshold,
+        "edge_threshold": args.edge_threshold,
+        "stride": args.motion_stride,
+        "pixel_stride": args.pixel_stride,
+    }
+
     frozen = run_pipeline(
         cameras_json=args.cameras,
         video_paths=args.videos,
@@ -249,6 +270,7 @@ def main():
         consensus=args.consensus,
         calibration_n_frames=args.calibration_frames,
         max_frames_per_camera=args.max_frames,
+        motion_kwargs=motion_kwargs,
     )
     save_frozen_scenes(frozen, args.out)
     print(f"Saved → {args.out}")

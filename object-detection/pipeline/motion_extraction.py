@@ -104,6 +104,7 @@ def extract_motion(
     detect_mode: DetectMode = "combined",
     edge_threshold: float = 0.5,
     edge_ksize: int = 3,
+    pixel_stride: int = 1,
 ) -> Iterator[MotionFrame]:
     """Yield one MotionFrame per video frame (skipping the first, which has no
     predecessor to subtract from).
@@ -138,9 +139,14 @@ def extract_motion(
         the intensity channel can't see (slow/distant/low-contrast objects).
     edge_ksize : int
         Sobel kernel size for the edge channel (1, 3, 5, or 7). Default 3.
+    pixel_stride : int
+        Spatial decimation of the output mask: keep only every Nth row/column.
+        Reduces ray count downstream by N². 1 = full resolution.
     """
     if detect_mode not in ("intensity", "edge", "combined"):
         raise ValueError(f"unknown detect_mode={detect_mode!r}")
+    if pixel_stride < 1:
+        raise ValueError(f"pixel_stride must be >= 1, got {pixel_stride}")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -210,6 +216,11 @@ def extract_motion(
                     mask_u8 = mask_total.astype(np.uint8) * 255
                     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, morph_kernel)
                     mask_total = mask_u8 > 0
+
+                if pixel_stride > 1:
+                    sieve = np.zeros_like(mask_total, dtype=bool)
+                    sieve[::pixel_stride, ::pixel_stride] = True
+                    mask_total &= sieve
 
                 intensity = np.where(mask_total, intensity, 0).astype(np.uint8)
             else:
